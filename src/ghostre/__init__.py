@@ -11,4 +11,4 @@ Every inspector is bounds-checked and total: malformed input yields
 whatever parsed plus a ``warnings`` list, never a crash.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

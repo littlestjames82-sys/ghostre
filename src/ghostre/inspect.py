@@ -6,8 +6,8 @@ directory:
 
     path, size, sha256, format, detail, entropy, strings, warnings
 
-``format`` is one of: elf, pe, macho, wasm, apk, zip, pyc, sqlite,
-plist, javascript-app, text, unknown.
+``format`` is one of: elf, pe, macho, wasm, dex, apk, zip, pyc,
+sqlite, plist, javascript-app, text, unknown.
 
 Inspectors never raise on malformed input: they return whatever
 parsed and note the problem in ``warnings``. The only hard failure
@@ -210,6 +210,7 @@ PE_CHARACTERISTICS = {
 
 def inspect_pe(data: bytes, warnings: list) -> dict:
     d = {}
+    d["managed"] = {"clr": False}
     if len(data) < 0x40:
         warnings.append("pe: file shorter than DOS header")
         return d
@@ -235,6 +236,8 @@ def inspect_pe(data: bytes, warnings: list) -> dict:
         is64 = False
         imports_rva = 0
         imports_size = 0
+        clr_rva = 0
+        clr_size = 0
         if opt_size >= 2 and opt + 2 <= len(data):
             magic = _u16(data, opt)
             if magic == 0x20B:
@@ -256,6 +259,19 @@ def inspect_pe(data: bytes, warnings: list) -> dict:
                     and dir_base + 16 <= len(data):
                 imports_rva = _u32(data, dir_base + 8)
                 imports_size = _u32(data, dir_base + 12)
+            # Data directory 14 is the COM descriptor (CLR
+            # header) — its presence is what makes a PE a
+            # managed (.NET) image.
+            num_dirs = 0
+            nd_off = 108 if is64 else 92
+            if opt_size >= nd_off + 4 \
+                    and opt + nd_off + 4 <= len(data):
+                num_dirs = _u32(data, opt + nd_off)
+            if num_dirs > 14 \
+                    and opt_size >= (112 if is64 else 96) + 120 \
+                    and dir_base + 120 <= len(data):
+                clr_rva = _u32(data, dir_base + 112)
+                clr_size = _u32(data, dir_base + 116)
         sections = []
         sec_off = opt + opt_size
         for i in range(min(nsects, 96)):
@@ -302,9 +318,246 @@ def inspect_pe(data: bytes, warnings: list) -> dict:
                     if name:
                         dlls.append(name)
         d["imports"] = dlls
+        if clr_rva:
+            d["managed"] = _inspect_clr(data, clr_rva, rva_to_off,
+                                        warnings)
     except (struct.error, IndexError) as e:
         warnings.append(f"pe: truncated ({e})")
     return d
+
+
+# ---------------------------------------------------------------- #
+# PE / .NET (CLR) — data directory 14 + metadata root + #~ stream.
+#
+# The runtime version string lives in the metadata root header;
+# the assembly name needs a walk over the #~ tables stream to the
+# Assembly table (id 32), whose offset depends on the row size of
+# every table before it. That walk is implemented with the
+# ECMA-335 column schemas below and is fully bounds-checked: any
+# inconsistency raises _ClrFail and the name is simply omitted.
+
+class _ClrFail(Exception):
+    """Internal: a CLR sub-parse hit something inconsistent."""
+
+
+# Column tokens for the #~ table schemas:
+#   ("u", n)    fixed n-byte unsigned field
+#   ("s",)      #Strings heap index   ("g",)  #GUID heap index
+#   ("b",)      #Blob heap index
+#   ("i", tid)  simple index into table tid
+#   ("c", bits, (tids...))  coded index over the given tables
+_CLR_CODED = {
+    "TypeDefOrRef": (2, (2, 1, 27)),
+    "HasConstant": (2, (4, 8, 23)),
+    "HasCustomAttribute": (5, (6, 4, 1, 2, 8, 9, 10, 0, 14, 23,
+                               20, 17, 26, 27, 32, 35, 38, 39, 40,
+                               42, 44)),
+    "HasFieldMarshal": (1, (4, 8)),
+    "HasDeclSecurity": (2, (2, 6, 32)),
+    "MemberRefParent": (3, (2, 1, 26, 6, 27)),
+    "HasSemantics": (1, (20, 23)),
+    "MethodDefOrRef": (1, (6, 10)),
+    "MemberForwarded": (1, (4, 6)),
+    "Implementation": (2, (38, 35, 39)),
+    "CustomAttributeType": (3, (6, 10)),
+    "ResolutionScope": (2, (0, 26, 35, 1)),
+    "TypeOrMethodDef": (1, (2, 6)),
+}
+
+
+def _cd(name):
+    bits, tids = _CLR_CODED[name]
+    return ("c", bits, tids)
+
+
+_CLR_TABLES = {
+    0: [("u", 2), ("s",), ("g",), ("g",), ("g",)],          # Module
+    1: [_cd("ResolutionScope"), ("s",), ("s",)],            # TypeRef
+    2: [("u", 4), ("s",), ("s",), _cd("TypeDefOrRef"),
+        ("i", 4), ("i", 6)],                                # TypeDef
+    3: [("i", 4)],                                          # FieldPtr
+    4: [("u", 2), ("s",), ("b",)],                          # Field
+    5: [("i", 6)],                                          # MethodPtr
+    6: [("u", 4), ("u", 2), ("u", 2), ("s",), ("b",),
+        ("i", 8)],                                          # MethodDef
+    7: [("i", 8)],                                          # ParamPtr
+    8: [("u", 2), ("u", 2), ("s",)],                        # Param
+    9: [("i", 2), _cd("TypeDefOrRef")],                     # InterfaceImpl
+    10: [_cd("MemberRefParent"), ("s",), ("b",)],           # MemberRef
+    11: [("u", 2), _cd("HasConstant"), ("b",)],             # Constant
+    12: [_cd("HasCustomAttribute"), _cd("CustomAttributeType"),
+         ("b",)],                                           # CustomAttribute
+    13: [_cd("HasFieldMarshal"), ("b",)],                   # FieldMarshal
+    14: [("u", 2), _cd("HasDeclSecurity"), ("b",)],         # DeclSecurity
+    15: [("u", 2), ("u", 4), ("i", 2)],                     # ClassLayout
+    16: [("u", 4), ("i", 4)],                               # FieldLayout
+    17: [("b",)],                                           # StandAloneSig
+    18: [("i", 2), ("i", 20)],                              # EventMap
+    19: [("i", 20)],                                        # EventPtr
+    20: [("u", 2), ("s",), _cd("TypeDefOrRef")],            # Event
+    21: [("i", 2), ("i", 23)],                              # PropertyMap
+    22: [("i", 23)],                                        # PropertyPtr
+    23: [("u", 2), ("s",), ("b",)],                         # Property
+    24: [("u", 2), ("i", 6), _cd("HasSemantics")],          # MethodSemantics
+    25: [("i", 2), _cd("MethodDefOrRef"),
+         _cd("MethodDefOrRef")],                            # MethodImpl
+    26: [("s",)],                                           # ModuleRef
+    27: [("b",)],                                           # TypeSpec
+    28: [("u", 2), _cd("MemberForwarded"), ("s",),
+         ("i", 26)],                                        # ImplMap
+    29: [("u", 4), ("i", 4)],                               # FieldRVA
+    30: [("u", 4), ("u", 4)],                               # EncLog
+    31: [("u", 4)],                                         # EncMap
+    32: [("u", 4), ("u", 2), ("u", 2), ("u", 2), ("u", 2),
+         ("u", 4), ("b",), ("s",), ("s",)],                 # Assembly
+}
+
+
+def _clr_idx_size(rows: int) -> int:
+    return 2 if rows < 0x10000 else 4
+
+
+def _clr_coded_size(bits: int, tids, rows_by_tid: dict) -> int:
+    biggest = max((rows_by_tid.get(t, 0) for t in tids), default=0)
+    return 2 if biggest < (1 << (16 - bits)) else 4
+
+
+def _clr_row_size(tid: int, rows_by_tid: dict, heap_sizes: int) -> int:
+    cols = _CLR_TABLES.get(tid)
+    if cols is None:
+        raise _ClrFail(f"no schema for metadata table {tid}")
+    str_sz = 4 if heap_sizes & 0x01 else 2
+    guid_sz = 4 if heap_sizes & 0x02 else 2
+    blob_sz = 4 if heap_sizes & 0x04 else 2
+    total = 0
+    for col in cols:
+        kind = col[0]
+        if kind == "u":
+            total += col[1]
+        elif kind == "s":
+            total += str_sz
+        elif kind == "g":
+            total += guid_sz
+        elif kind == "b":
+            total += blob_sz
+        elif kind == "i":
+            total += _clr_idx_size(rows_by_tid.get(col[1], 0))
+        else:  # coded
+            total += _clr_coded_size(col[1], col[2], rows_by_tid)
+    return total
+
+
+def _clr_streams(data: bytes, root: int, warnings: list):
+    """Parse the metadata root at file offset ``root``. Returns
+    (version_string, {stream_name: (abs_off, size)})."""
+    if root < 0 or root + 16 > len(data):
+        raise _ClrFail("metadata root out of bounds")
+    if _u32(data, root) != 0x424A5342:  # "BSJB"
+        raise _ClrFail("metadata root signature missing")
+    ver_len = _u32(data, root + 12)
+    if ver_len > 4096 or root + 16 + ver_len > len(data):
+        raise _ClrFail("metadata version string out of bounds")
+    raw = data[root + 16:root + 16 + ver_len]
+    version = raw.split(b"\x00")[0].decode("utf-8", "replace")
+    pos = root + 16 + ver_len
+    if pos + 4 > len(data):
+        raise _ClrFail("metadata stream count out of bounds")
+    nstreams = _u16(data, pos + 2)
+    pos += 4
+    streams = {}
+    for _ in range(min(nstreams, 16)):
+        if pos + 8 > len(data):
+            raise _ClrFail("stream header truncated")
+        off = _u32(data, pos)
+        size = _u32(data, pos + 4)
+        name_start = pos + 8
+        nul = data.find(b"\x00", name_start,
+                        min(len(data), name_start + 32))
+        if nul < 0:
+            raise _ClrFail("stream name unterminated")
+        name = data[name_start:nul].decode("ascii", "replace")
+        streams[name] = (root + off, size)
+        field = ((nul - name_start + 1) + 3) // 4 * 4
+        pos = name_start + field
+    return version, streams
+
+
+def _clr_assembly_name(tilde: bytes, str_heap: bytes):
+    """Best-effort Assembly-table name from a #~ stream. Raises
+    _ClrFail on anything inconsistent."""
+    if len(tilde) < 24:
+        raise _ClrFail("#~ stream shorter than its header")
+    heap_sizes = tilde[6]
+    valid = struct.unpack_from("<Q", tilde, 8)[0]
+    present = [t for t in range(64) if valid >> t & 1]
+    rows_by_tid = {}
+    pos = 24
+    for tid in present:
+        if pos + 4 > len(tilde):
+            raise _ClrFail("#~ row counts truncated")
+        rows_by_tid[tid] = _u32(tilde, pos)
+        pos += 4
+    if 32 not in rows_by_tid or rows_by_tid[32] == 0:
+        return None
+    off = pos
+    for tid in present:
+        if tid >= 32:
+            break
+        off += _clr_row_size(tid, rows_by_tid, heap_sizes) \
+            * rows_by_tid[tid]
+    row_size = _clr_row_size(32, rows_by_tid, heap_sizes)
+    if off + row_size > len(tilde):
+        raise _ClrFail("Assembly table row out of bounds")
+    str_sz = 4 if heap_sizes & 0x01 else 2
+    blob_sz = 4 if heap_sizes & 0x04 else 2
+    # Assembly columns: HashAlgId u32, 4 x u16 versions, Flags
+    # u32, PublicKey blob idx, Name string idx, Culture idx.
+    name_pos = off + 16 + blob_sz
+    name_idx = _u32(tilde, name_pos) if str_sz == 4 \
+        else _u16(tilde, name_pos)
+    name = _cstring(str_heap, name_idx, 1024)
+    return name or None
+
+
+def _inspect_clr(data: bytes, clr_rva: int, rva_to_off,
+                 warnings: list) -> dict:
+    m = {"clr": True}
+    off = rva_to_off(clr_rva)
+    if off < 0 or off + 72 > len(data):
+        warnings.append("pe: CLR header RVA unmapped or truncated")
+        return m
+    meta_rva = _u32(data, off + 8)
+    flags = _u32(data, off + 16)
+    m["strong_name_signed"] = bool(flags & 0x8)
+    m["entry_point_token"] = _u32(data, off + 20)
+    try:
+        version, streams = _clr_streams(
+            data, rva_to_off(meta_rva), warnings)
+        m["runtime_version"] = version
+        tilde = None
+        for nm in ("#~", "#-"):
+            if nm in streams:
+                so, ss = streams[nm]
+                tilde = data[so:so + ss]
+                break
+        sref = streams.get("#Strings")
+        if tilde is not None and sref is not None:
+            heap = data[sref[0]:sref[0] + sref[1]]
+            name = _clr_assembly_name(tilde, heap)
+            if name:
+                m["assembly_name"] = name
+            else:
+                warnings.append(
+                    "pe: assembly name not resolved from #~ tables")
+        else:
+            warnings.append(
+                "pe: #~ or #Strings stream missing; assembly "
+                "name not resolved")
+    except _ClrFail as e:
+        warnings.append(f"pe: metadata parse stopped ({e})")
+    except (struct.error, IndexError) as e:
+        warnings.append(f"pe: metadata parse truncated ({e})")
+    return m
 
 
 # ---------------------------------------------------------------- #
@@ -457,6 +710,115 @@ def inspect_wasm(data: bytes, warnings: list) -> dict:
 
 
 # ---------------------------------------------------------------- #
+# DEX (Android Dalvik bytecode)
+
+DEX_HEADER_SIZE = 112
+MAX_CLASSES = 100
+MAX_TYPE_SAMPLE = 40
+
+
+def _dex_descriptor_name(desc: str) -> str:
+    """Lcom/example/Foo; -> com.example.Foo; anything else
+    (primitives, arrays) stays as the raw descriptor."""
+    if len(desc) >= 2 and desc[0] == "L" and desc.endswith(";"):
+        return desc[1:-1].replace("/", ".")
+    return desc
+
+
+def inspect_dex(data: bytes, warnings: list) -> dict:
+    d = {}
+    if len(data) >= 8:
+        d["version"] = data[4:7].decode("ascii", "replace")
+    if len(data) < DEX_HEADER_SIZE:
+        warnings.append("dex: file shorter than the 112-byte header")
+        return d
+    endian_tag = _u32(data, 40, "<")
+    if endian_tag == 0x12345678:
+        en = "<"
+        d["endianness"] = "little"
+    elif endian_tag == 0x78563412:
+        en = ">"
+        d["endianness"] = "big"
+    else:
+        en = "<"
+        d["endianness"] = "little"
+        warnings.append(
+            f"dex: unusual endian tag {endian_tag:#x}; "
+            "assuming little-endian")
+    d["endian_tag"] = hex(endian_tag)
+    d["file_size"] = _u32(data, 32, en)
+    d["header_size"] = _u32(data, 36, en)
+    counts = {}
+    for label, size_off in (
+            ("string", 56), ("type", 64), ("proto", 72),
+            ("field", 80), ("method", 88), ("class", 96)):
+        counts[label] = (_u32(data, size_off, en),
+                         _u32(data, size_off + 4, en))
+    for label in ("string", "type", "proto", "field", "method",
+                  "class"):
+        d[label + "_count"] = counts[label][0]
+    str_size, str_off = counts["string"]
+    type_size, type_off = counts["type"]
+    class_size, class_off = counts["class"]
+    if str_off + 4 * str_size > len(data) \
+            or type_off + 4 * type_size > len(data):
+        warnings.append("dex: string/type id tables extend past "
+                        "end of file")
+
+    def read_string(idx):
+        """string_ids[idx] -> str, or None when anything is off."""
+        if idx < 0 or idx >= str_size:
+            return None
+        id_pos = str_off + 4 * idx
+        if id_pos + 4 > len(data):
+            return None
+        data_off = _u32(data, id_pos, en)
+        if data_off < 0 or data_off >= len(data):
+            return None
+        try:
+            _utf16_len, pos = _uleb(data, data_off)
+        except ValueError:
+            return None
+        end = data.find(b"\x00", pos)
+        if end < 0:
+            return None
+        return data[pos:end].decode("utf-8", "replace")
+
+    def type_descriptor(type_idx):
+        if type_idx < 0 or type_idx >= type_size:
+            return None
+        pos = type_off + 4 * type_idx
+        if pos + 4 > len(data):
+            return None
+        return read_string(_u32(data, pos, en))
+
+    sample = []
+    for i in range(min(type_size, MAX_TYPE_SAMPLE)):
+        desc = type_descriptor(i)
+        if desc is not None:
+            sample.append(_dex_descriptor_name(desc))
+    d["referenced_types"] = sample
+    classes = []
+    unresolvable = 0
+    for i in range(min(class_size, 100000)):
+        pos = class_off + 32 * i
+        if pos + 32 > len(data):
+            warnings.append("dex: class_defs table truncated")
+            break
+        desc = type_descriptor(_u32(data, pos, en))
+        if desc is None:
+            unresolvable += 1
+            continue
+        if len(classes) < MAX_CLASSES:
+            classes.append(_dex_descriptor_name(desc))
+    if unresolvable:
+        warnings.append(
+            f"dex: {unresolvable} class descriptor(s) unresolvable")
+    d["classes"] = classes
+    return d
+
+
+# ---------------------------------------------------------------- #
 # ZIP / APK
 
 SIG_SUFFIXES = (".SF", ".RSA", ".DSA", ".EC")
@@ -466,10 +828,21 @@ DEX_RE = re.compile(r"^classes\d*\.dex$")
 def inspect_zip(path: Path, data: bytes, warnings: list,
                 is_apk: bool) -> dict:
     d = {}
+    dex_blobs = {}
     try:
         with zipfile.ZipFile(path) as z:
             infos = z.infolist()
             names = [i.filename for i in infos]
+            if is_apk:
+                for info in infos:
+                    if DEX_RE.match(info.filename):
+                        try:
+                            dex_blobs[info.filename] = z.read(
+                                info.filename)
+                        except Exception as e:
+                            warnings.append(
+                                f"apk: could not read "
+                                f"{info.filename} ({e})")
     except zipfile.BadZipFile as e:
         warnings.append(f"zip: bad zip file ({e})")
         names = []
@@ -484,6 +857,23 @@ def inspect_zip(path: Path, data: bytes, warnings: list,
             n for n in names
             if n.startswith("META-INF/")
             and n.upper().endswith(SIG_SUFFIXES)]
+        dex_details = []
+        for name in d["dex_files"]:
+            blob = dex_blobs.get(name)
+            if blob is None:
+                continue
+            local_warnings: list = []
+            dd = inspect_dex(blob, local_warnings)
+            dex_details.append({
+                "name": name,
+                "class_count": dd.get("class_count"),
+                "classes": dd.get("classes", []),
+                "string_count": dd.get("string_count"),
+                "type_count": dd.get("type_count"),
+                "method_count": dd.get("method_count"),
+                "warnings": local_warnings,
+            })
+        d["dex_details"] = dex_details
     return d
 
 
@@ -799,6 +1189,8 @@ def inspect_path(path_str) -> dict:
         fmt, detail = "macho", inspect_macho(data, warnings)
     elif data[:4] == b"\x00asm":
         fmt, detail = "wasm", inspect_wasm(data, warnings)
+    elif data[:4] == b"dex\n":
+        fmt, detail = "dex", inspect_dex(data, warnings)
     elif zipfile.is_zipfile(path):
         is_apk = suffix == ".apk"
         probe = inspect_zip(path, data, warnings, is_apk)

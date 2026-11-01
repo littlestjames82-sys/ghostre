@@ -451,6 +451,210 @@ def test_empty_file(tmp_path):
 
 
 # ---------------------------------------------------------------- #
+# DEX
+
+def _uleb128(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def build_dex() -> bytes:
+    strings = [b"Lcom/example/Foo;", b"Lcom/example/Bar;",
+               b"Ljava/lang/Object;", b"I"]
+    header = 112
+    str_ids_off = header
+    type_ids_off = str_ids_off + 4 * len(strings)
+    proto_ids_off = type_ids_off + 4 * len(strings)
+    field_ids_off = proto_ids_off + 12
+    method_ids_off = field_ids_off + 8
+    class_defs_off = method_ids_off + 8
+    data_off = class_defs_off + 32 * 2
+    blobs = []
+    str_data_offs = []
+    pos = data_off
+    for s in strings:
+        item = _uleb128(len(s)) + s + b"\x00"
+        str_data_offs.append(pos)
+        blobs.append(item)
+        pos += len(item)
+    total = pos
+    hdr = bytearray(header)
+    hdr[0:8] = b"dex\n035\x00"
+    struct.pack_into("<I", hdr, 32, total)
+    struct.pack_into("<I", hdr, 36, header)
+    struct.pack_into("<I", hdr, 40, 0x12345678)
+    struct.pack_into("<II", hdr, 56, len(strings), str_ids_off)
+    struct.pack_into("<II", hdr, 64, len(strings), type_ids_off)
+    struct.pack_into("<II", hdr, 72, 1, proto_ids_off)
+    struct.pack_into("<II", hdr, 80, 1, field_ids_off)
+    struct.pack_into("<II", hdr, 88, 1, method_ids_off)
+    struct.pack_into("<II", hdr, 96, 2, class_defs_off)
+    struct.pack_into("<II", hdr, 104, total - data_off, data_off)
+    out = bytes(hdr)
+    out += b"".join(struct.pack("<I", o) for o in str_data_offs)
+    out += b"".join(struct.pack("<I", i) for i in range(4))
+    out += b"\x00" * 12          # one proto_id
+    out += b"\x00" * 8           # one field_id
+    out += b"\x00" * 8           # one method_id
+    for class_idx in (0, 1):
+        out += struct.pack("<IIIIIIII", class_idx, 0x1, 2, 0, 0,
+                           0, 0, 0)
+    out += b"".join(blobs)
+    assert len(out) == total
+    return out
+
+
+def test_dex(tmp_path):
+    p = tmp_path / "classes.dex"
+    blob = build_dex()
+    p.write_bytes(blob)
+    r = inspect_path(p)
+    assert r["format"] == "dex"
+    d = r["detail"]
+    assert d["version"] == "035"
+    assert d["header_size"] == 112
+    assert d["endianness"] == "little"
+    assert d["endian_tag"] == "0x12345678"
+    assert d["file_size"] == len(blob)
+    assert d["string_count"] == 4
+    assert d["type_count"] == 4
+    assert d["proto_count"] == 1
+    assert d["field_count"] == 1
+    assert d["method_count"] == 1
+    assert d["class_count"] == 2
+    assert d["classes"] == ["com.example.Foo", "com.example.Bar"]
+    assert "java.lang.Object" in d["referenced_types"]
+    assert "I" in d["referenced_types"]
+    assert r["warnings"] == []
+
+
+def test_dex_in_apk(tmp_path):
+    p = tmp_path / "real.apk"
+    with zipfile.ZipFile(p, "w") as z:
+        z.writestr("AndroidManifest.xml", b"\x03\x00\x08\x00")
+        z.writestr("classes.dex", build_dex())
+    r = inspect_path(p)
+    assert r["format"] == "apk"
+    dd = r["detail"]["dex_details"]
+    assert len(dd) == 1
+    assert dd[0]["name"] == "classes.dex"
+    assert dd[0]["class_count"] == 2
+    assert dd[0]["classes"] == ["com.example.Foo",
+                                "com.example.Bar"]
+    assert dd[0]["string_count"] == 4
+    assert dd[0]["warnings"] == []
+
+
+def test_truncated_dex(tmp_path):
+    p = tmp_path / "trunc.dex"
+    p.write_bytes(build_dex()[:60])
+    r = inspect_path(p)
+    assert r["format"] == "dex"
+    assert r["warnings"]
+    assert r["detail"]["version"] == "035"
+
+
+def test_dex_tables_truncated(tmp_path):
+    p = tmp_path / "trunc2.dex"
+    p.write_bytes(build_dex()[:200])
+    r = inspect_path(p)
+    assert r["format"] == "dex"
+    assert r["warnings"]  # truncated class_defs / string data
+
+
+def test_dex_magic_only(tmp_path):
+    p = tmp_path / "tiny.dex"
+    p.write_bytes(b"dex\n035\x00")
+    r = inspect_path(p)
+    assert r["format"] == "dex"
+    assert r["warnings"]
+
+
+# ---------------------------------------------------------------- #
+# PE: native vs managed (.NET)
+
+def build_pe_managed() -> bytes:
+    pe_off = 0x80
+    raw_off = 512
+    dos = bytearray(pe_off)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, pe_off)
+    opt = bytearray(224)
+    struct.pack_into("<H", opt, 0, 0x10B)          # PE32
+    struct.pack_into("<H", opt, 68, 3)             # subsystem console
+    struct.pack_into("<I", opt, 92, 16)            # number of dirs
+    struct.pack_into("<I", opt, 96 + 8, 0x1000)    # import dir RVA
+    struct.pack_into("<I", opt, 96 + 12, 40)       # import dir size
+    struct.pack_into("<I", opt, 96 + 112, 0x1040)  # CLR dir RVA
+    struct.pack_into("<I", opt, 96 + 116, 72)      # CLR dir size
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 224, 0x0022)
+    sect = struct.pack("<8sIIIIIIHHI", b".text\x00\x00\x00", 0x1000,
+                       0x1000, 0x200, raw_off, 0, 0, 0, 0, 0x60000020)
+    head = bytes(dos) + b"PE\x00\x00" + coff + bytes(opt) + sect
+    head = head.ljust(raw_off, b"\x00")
+    body = bytearray(0x200)
+    struct.pack_into("<IIIII", body, 0, 0, 0, 0, 0x1028, 0)
+    body[40:40 + 13] = b"KERNEL32.dll\x00"
+    # #Strings heap: idx 1 = module name, idx 13 = assembly name.
+    strings_heap = b"\x00GhostModule\x00GhostFixture\x00"
+    # #~ stream: Module table (1 row) + Assembly table (1 row).
+    tilde = bytearray()
+    tilde += struct.pack("<IBBBBQQ", 0, 2, 0, 0, 1,
+                         (1 << 0) | (1 << 32), 0)
+    tilde += struct.pack("<II", 1, 1)              # row counts
+    tilde += struct.pack("<HHHHH", 0, 1, 1, 0, 0)  # Module row
+    tilde += struct.pack("<IHHHHIHHH", 0x8004, 1, 2, 3, 4, 0, 0,
+                         13, 0)                    # Assembly row
+    assert len(tilde) == 64
+    ver = b"v4.0.30319\x00\x00"
+    root = bytearray()
+    root += struct.pack("<IHHI", 0x424A5342, 1, 1, 0)
+    root += struct.pack("<I", len(ver))
+    root += ver
+    root += struct.pack("<HH", 0, 2)               # flags, nstreams
+    tilde_off = 32 + 12 + 20
+    strings_off = tilde_off + len(tilde)
+    root += struct.pack("<II", tilde_off, len(tilde)) + b"#~\x00\x00"
+    root += struct.pack("<II", strings_off,
+                        len(strings_heap)) + b"#Strings\x00\x00\x00\x00"
+    root += tilde
+    root += strings_heap
+    # CLR header (72 bytes) at body 0x40 -> RVA 0x1040.
+    struct.pack_into("<IHH", body, 0x40, 0x48, 2, 5)
+    struct.pack_into("<II", body, 0x48, 0x10C0, len(root))
+    struct.pack_into("<I", body, 0x50, 0x9)   # IL_ONLY|STRONGNAMESIGNED
+    struct.pack_into("<I", body, 0x54, 0x06000001)
+    body[0xC0:0xC0 + len(root)] = root
+    return head + bytes(body)
+
+
+def test_pe_managed(tmp_path):
+    p = tmp_path / "managed.dll"
+    p.write_bytes(build_pe_managed())
+    r = inspect_path(p)
+    assert r["format"] == "pe"
+    m = r["detail"]["managed"]
+    assert m["clr"] is True
+    assert m["runtime_version"] == "v4.0.30319"
+    assert m["assembly_name"] == "GhostFixture"
+    assert m["strong_name_signed"] is True
+    assert m["entry_point_token"] == 0x06000001
+    assert r["detail"]["imports"] == ["KERNEL32.dll"]
+
+
+def test_pe_native_is_not_managed(pe_file):
+    r = inspect_path(pe_file)
+    assert r["detail"]["managed"] == {"clr": False}
+
+
+# ---------------------------------------------------------------- #
 # CLI contract
 
 def test_cli_missing_file(tmp_path, capsys):
