@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ghostre"
+version = "0.1.0"
+description = "Ghost-native reverse-engineering inspector: format identification, headers, imports, entropy and strings for binaries, packages and JavaScript apps, offline and stdlib only"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Ghost Developer Studio" }]
+keywords = ["reverse-engineering", "binary-analysis", "ghostide", "agents"]
+dependencies = []
+
+[project.scripts]
+ghostre = "ghostre.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
