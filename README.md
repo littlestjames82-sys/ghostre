@@ -1,5 +1,5 @@
 # GhostRE
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/littlestjames82-sys/ghostre/actions/workflows/ci.yml/badge.svg)](https://github.com/littlestjames82-sys/ghostre/actions/workflows/ci.yml)
 
 Ghost-native reverse-engineering inspector for Ghost Developer
 Studio. GhostRE is Wave 2 of bringing REA's (Reverse Engineer
